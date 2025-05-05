@@ -6,6 +6,7 @@ import logging
 import dateparser
 from datetime import datetime
 import re
+from datetime import timedelta
 
 # ロギングの設定
 logging.basicConfig(level=logging.INFO)
@@ -237,6 +238,69 @@ async def slack_events(req: Request):
             channel = event["channel"]
             text = event.get("text", "")
             message_ts = event.get("ts", "")
+            thread_ts = event.get("thread_ts", None)
+
+            # スレッド内での「:emoji:に決定します。」形式の決定メッセージか判定
+            # スレッド内での決定メッセージ判定（「:emoji:」が含まれていればOK）
+            if thread_ts:
+                # メッセージ内のすべての:emoji:を抽出
+                emoji_matches = re.findall(r'(:\w+:)', text)
+                if emoji_matches:
+                    candidate = candidate_messages.get(thread_ts)
+                    if candidate:
+                        decided = []
+                        for emoji in emoji_matches:
+                            normalized_emoji = emoji
+                            m = re.match(r":(\w+):", emoji)
+                            if m:
+                                normalized_emoji = f":{normalize_emoji(m.group(1))}:"
+                            dt = candidate["options"].get(normalized_emoji)
+                            if dt:
+                                dt_str = dt.strftime('%Y/%m/%d %H:%M')
+                                decided.append((normalized_emoji,dt, dt_str))
+                        if decided:
+                            # 複数の場合はリスト形式で出力
+                            if len(decided) == 1:
+                                emoji, dt_obj, dt_str = decided[0]
+                                if dt_obj.hour < 8:
+                                    reminder_dt = dt_obj.replace(hour=8, minute=0) - timedelta(days=1)
+                                else:
+                                    reminder_dt = dt_obj.replace(hour=8, minute=0)
+                                reminder_str = reminder_dt.strftime('%Y/%m/%d %H:%M')
+                                msg = (f"日時を\n{emoji} {dt_str}\nに決定しました。\n"
+                                       f"{reminder_str}にリマインドします。")
+                            else:
+                                msg = "日時を\n"
+                                for emoji, dt_obj, dt_str in decided:
+                                    if dt_obj.hour < 8:
+                                        reminder_dt = dt_obj.replace(hour=8, minute=0) - timedelta(days=1)
+                                    else:
+                                        reminder_dt = dt_obj.replace(hour=8, minute=0)
+                                    reminder_str = reminder_dt.strftime('%Y/%m/%d %H:%M')
+                                    msg += f"{emoji} {dt_str} （リマインド: {reminder_str}）\n"
+                                msg += "に決定しました。"
+                            slack_client.chat_postMessage(
+                                channel=channel,
+                                text=msg,
+                                thread_ts=thread_ts
+                            )
+                            logger.info(f"日程決定: {decided}")
+                        else:
+                            slack_client.chat_postEphemeral(
+                                channel=channel,
+                                user=user,
+                                text=f"指定されたスタンプに対応する日時が候補にありません。"
+                            )
+                            logger.info(f"決定スタンプが候補にありません: {emoji_matches}")
+                    else:
+                        slack_client.chat_postEphemeral(
+                            channel=channel,
+                            user=user,
+                            text="このスレッドは候補日投稿ではありません。"
+                        )
+                        logger.info("スレッドが候補日投稿ではありません")
+                    return {"ok": True}
+
             
             # 候補日時を抽出
             options = extract_datetime_options(text)
