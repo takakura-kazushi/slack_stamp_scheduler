@@ -2,7 +2,6 @@ from fastapi import APIRouter, Request
 from slack_sdk.web import WebClient
 import os, re, logging
 from datetime import datetime, timedelta
-import dateparser  # ※ 現在は使用していませんが、必要に応じて活用できます
 from dotenv import load_dotenv
 
 
