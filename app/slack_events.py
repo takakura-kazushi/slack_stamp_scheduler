@@ -2,6 +2,7 @@ from fastapi import APIRouter, Request
 from slack_sdk.web import WebClient
 import os, re, logging
 from datetime import datetime, timedelta
+import pytz
 from dotenv import load_dotenv
 from .db import supabase
 from .scheduler import scheduler
@@ -9,6 +10,9 @@ from .scheduler import scheduler
 load_dotenv(verbose=True)
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# 日本時間のタイムゾーンオブジェクトを定義
+JST = pytz.timezone('Asia/Tokyo')
 
 # 環境変数が正しく設定されているか確認
 bot_token = os.getenv("SLACK_BOT_TOKEN")
@@ -19,8 +23,7 @@ else:
 
 # Slack クライアント
 slack_client = WebClient(token=bot_token)
-# 候補日投稿メッセージの情報を保持する辞書
-candidate_messages = {}
+
 
 def clean_datetime_text(text):
     text = text.replace('：', ':')
@@ -59,7 +62,7 @@ def clean_datetime_text(text):
 
 def extract_datetime(text: str):
     cleaned_text = clean_datetime_text(text)
-    now = datetime.now()
+    now = datetime.now(JST)
     date_patterns = [
         r'(\d{1,2})/(\d{1,2})',
         r'(\d{4})/(\d{1,2})/(\d{1,2})',
@@ -101,7 +104,9 @@ def extract_datetime(text: str):
             if '半' in time_match.group(0):
                 minute = 30
     try:
-        dt = datetime(year, month, day, hour, minute)
+        # naiveなdatetimeオブジェクトを作成
+        naive_dt = datetime(year, month, day, hour, minute)
+        dt = JST.localize(naive_dt)
         if dt < now:
             dt = dt.replace(year=dt.year + 1)
         return dt
@@ -118,15 +123,6 @@ def normalize_emoji(emoji):
         return number_map.get(emoji, emoji)
     return emoji
 
-def normalize_reaction(reaction):
-    number_map = {
-        '1': 'one', '2': 'two', '3': 'three', '4': 'four',
-        '5': 'five', '6': 'six', '7': 'seven', '8': 'eight',
-        '9': 'nine', '0': 'zero'
-    }
-    if reaction.isdigit():
-        return number_map.get(reaction, reaction)
-    return reaction
 
 def extract_datetime_options(text):
     options = {}
@@ -144,13 +140,14 @@ def extract_datetime_options(text):
             else:
                 logger.info(f"日時を解析できませんでした: {datetime_str}")
     return options
+
 def send_reminder(main_message_ts: str):
     """
     指定されたスケジュールID（main_message_ts）に基づいてリマインドを送信する
     """
     logger.info(f"リマインドジョブを実行します: {main_message_ts}")
     try:
-        # Supabaseからスケジュールを取得
+        # DBからスケジュール情報を取得
         response = supabase.table('schedules').select('*').eq('main_message_ts', main_message_ts).single().execute()
         schedule_data = response.data
 
@@ -168,11 +165,23 @@ def send_reminder(main_message_ts: str):
         
         user_ids = participants[selected_emoji]
 
-        # リマインドメッセージを作成
-        event_dt = datetime.fromisoformat(schedule_data['selected_datetime'])
+        # 1. DBからISO形式の文字列を取得
+        iso_string = schedule_data['selected_datetime']
+        
+        # 2. タイムゾーン情報を持ったdatetimeオブジェクトに変換
+        aware_dt = datetime.fromisoformat(iso_string)
+        
+        # 3. JSTに変換してからフォーマット
+        if aware_dt.tzinfo is None:
+            # タイムゾーン情報がない場合はJSTとして扱う
+            jst_dt = JST.localize(aware_dt)
+        else:
+            # タイムゾーン情報がある場合はJSTに変換
+            jst_dt = aware_dt.astimezone(JST)
+
         message = (
             f"🔔 リマインダーです！\n\n"
-            f"明日 **{event_dt.strftime('%m月%d日 %H:%M')}** からの予定を忘れないでね！"
+            f"明日 **{jst_dt.strftime('%m月%d日 %H:%M')}** からの予定を忘れないでね！"
         )
 
         # 各参加者にDMを送信
@@ -203,18 +212,30 @@ async def handle_slack_events(req: Request):
             if thread_ts:
                 emoji_matches = re.findall(r'(:\w+:)', text)
                 if emoji_matches:
-                    candidate = candidate_messages.get(thread_ts)
-                    if candidate:
+                    response = supabase.table('schedules').select('options').eq('main_message_ts', thread_ts).single().execute()
+                    candidate = response.data 
+                    if candidate and 'options' in candidate:
+                        # DBから取得したoptionsは文字列なのでdatetimeオブジェクトに変換する必要がある
+                        # ただし、この時点では文字列のままで比較しても問題ない
+                        # 実際のdtオブジェクトは、決定ロジックの中で別途取得・生成する
                         decided = []
                         for emoji in emoji_matches:
                             normalized_emoji = emoji
                             m = re.match(r":(\w+):", emoji)
                             if m:
                                 normalized_emoji = f":{normalize_emoji(m.group(1))}:"
-                            dt = candidate["options"].get(normalized_emoji)
-                            if dt:
-                                dt_str = dt.strftime('%Y/%m/%d %H:%M')
-                                decided.append((normalized_emoji, dt, dt_str))
+                            # DBから取得した日時文字列
+                        dt_str_from_db = candidate["options"].get(normalized_emoji)
+                        
+                        if dt_str_from_db:
+                            # 文字列をdatetimeオブジェクトに変換
+                            dt_obj = datetime.fromisoformat(dt_str_from_db)
+                            
+                            # datetimeオブジェクトを画面表示用の文字列にフォーマット
+                            dt_str_for_display = dt_obj.strftime('%Y/%m/%d %H:%M')
+                            
+                            # decidedリストには、datetimeオブジェクトを格納する
+                            decided.append((normalized_emoji, dt_obj, dt_str_for_display))
                         if decided:
                             if len(decided) == 1:
                                 emoji, dt_obj, dt_str = decided[0]
@@ -238,7 +259,7 @@ async def handle_slack_events(req: Request):
                                 reminder_dt = dt_obj - timedelta(days=1)
 
                                 # 過去の日時になっていないかチェック
-                                if reminder_dt > datetime.now():
+                                if reminder_dt > datetime.now(JST):
                                     job_id = f"reminder_{thread_ts}_{emoji.strip(':')}"
                                     job = scheduler.add_job(
                                         send_reminder,
@@ -249,6 +270,12 @@ async def handle_slack_events(req: Request):
                                         replace_existing=True # 同じIDのジョブがあれば上書き
                                     )
                                     logger.info(f"リマインドを予約しました: JobID={job.id}, Time={reminder_dt}")
+
+                                    # ▼▼▼ デバッグ用のログを追加 ▼▼▼
+                                    logger.info("--- 現在の予約済みジョブ一覧 ---")
+                                    scheduler.print_jobs()
+                                    logger.info("---------------------------------")
+                                    # ▲▲▲ ここまで追加 ▲▲▲
 
                                     # DBにジョブIDなどを保存
                                     supabase.table('schedules').update({
@@ -278,8 +305,6 @@ async def handle_slack_events(req: Request):
             if options:
                 # 新しい候補日投稿をSupabaseに保存
                 save_new_schedule(message_ts, channel, options)
-
-                candidate_messages[message_ts] = {"channel": channel, "options": options}
                 logger.info(f"候補日投稿を記録しました: {message_ts}")
                 logger.info(f"候補日時: {options}")
                 message = f"<@{user}> 候補日を記録しました！\n```"
@@ -301,7 +326,7 @@ async def handle_slack_events(req: Request):
             
             if schedule_response.data:
                 schedule_options = schedule_response.data.get('options', {})
-                normalized_reaction = f":{normalize_reaction(reaction)}:"
+                normalized_reaction = f":{normalize_emoji(reaction)}:"
 
                 if normalized_reaction in schedule_options:
                     # DBを更新する関数を呼び出す
@@ -311,23 +336,6 @@ async def handle_slack_events(req: Request):
             else:
                 logger.info(f"候補日投稿以外のメッセージに対するリアクションは無視します: {message_ts}")
                 
-            channel_id = item.get("channel", "")
-            normalized_reaction = f":{normalize_reaction(reaction)}:"
-            if message_ts in candidate_messages:
-                message_info = candidate_messages[message_ts]
-                if normalized_reaction in message_info["options"]:
-                    logger.info("候補日投稿に対するリアクションが追加されました！")
-                    logger.info(f"ユーザー: {user_id}")
-                    logger.info(f"スタンプ: {normalized_reaction}")
-                    logger.info(f"選択された日時: {message_info['options'][normalized_reaction]}")
-                    logger.info(f"メッセージTS: {message_ts}")
-                    logger.info(f"チャンネルID: {channel_id}")
-                else:
-                    logger.info(f"無効なスタンプが押されました: {reaction}")
-                    logger.info(f"正規化後: {normalized_reaction}")
-                    logger.info(f"有効なスタンプ: {list(message_info['options'].keys())}")
-            else:
-                logger.info("候補日投稿以外のメッセージに対するリアクションは無視します")
 
         # リアクションが削除された場合の処理
         elif event.get("type") == "reaction_removed":
@@ -340,7 +348,7 @@ async def handle_slack_events(req: Request):
             schedule_response = supabase.table('schedules').select('options').eq('main_message_ts', message_ts).single().execute()
             
             if schedule_response.data:
-                normalized_reaction = f":{normalize_reaction(reaction)}:"
+                normalized_reaction = f":{normalize_emoji(reaction)}:"
                 # DBから参加者を削除する関数を呼び出す
                 remove_participant_from_db(message_ts, normalized_reaction, user_id)
 

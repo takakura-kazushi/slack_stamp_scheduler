@@ -4,3 +4,4 @@ slack_sdk==3.35.0
 supabase==2.16.0
 uvicorn
 apscheduler
+pytz

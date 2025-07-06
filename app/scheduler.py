@@ -1,4 +1,5 @@
 from apscheduler.schedulers.background import BackgroundScheduler
+import pytz
 
-# バックグラウンドで動作するスケジューラを作成
-scheduler = BackgroundScheduler()
+# タイムゾーンを'Asia/Tokyo'に設定してスケジューラを作成
+scheduler = BackgroundScheduler(timezone=pytz.timezone('Asia/Tokyo'))
