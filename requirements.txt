@@ -1,0 +1,4 @@
+fastapi==0.115.14
+python-dotenv==1.1.1
+slack_sdk==3.35.0
+supabase==2.16.0

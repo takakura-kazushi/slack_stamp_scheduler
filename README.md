@@ -142,22 +142,44 @@ Bot は以下のようにレスポンスを返す：
 - 日程決定はあくまで**人間の明示的アクション**（メンション＋スタンプ指定）によって行う
 - 自動で日程を決めることは（オプション扱いとしても）**初期段階では行わない**
 
+---
+
+## セットアップ手順
+
+1.  **リポジトリのクローン**
+    ```bash
+    git clone https://github.com/takakura-kazushi/slack_stamp_scheduler.git
+    ```
+2.  **仮想環境の作成と有効化**
+    ```bash
+    python -m venv venv
+    source venv/bin/activate
+    ```
+3.  **依存ライブラリのインストール**
+    ```bash
+    pip install -r requirements.txt
+    ```
+4.  **環境変数の設定**
+    `.env.example`をコピーして`.env`ファイルを作成し、以下の値を設定してください。
+
+    - `SLACK_BOT_TOKEN`: あなたの Slack Bot トークン
+    - `SUPABASE_URL`: Supabase プロジェクトの URL
+    - `SUPABASE_KEY`: Supabase プロジェクトの anon キー
+
+5.  **データベースの準備**
+    Supabase プロジェクトでテーブルを作成してください。スキーマは`## データベース設計`のセクションを参照。
+
 ## 開発環境での起動手順
 
-### FastAPI サーバーの起動
+1.  **FastAPI サーバーの起動**
+    ```bash
+    uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ```
+2.  **一時的な公開 URL の生成**
+    ```bash
+    ngrok http 8000
+    ```
+3.  **Slack API に Request URL を登録**
+    ngrok で生成された URL の末尾に`/slack/events`を付け、Slack アプリの Event Subscriptions に登録します。
 
-app で以下を実行
-
-```
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-### 一時的な公開 URL の生成
-
-```
-ngrok http 8000
-```
-
-### Slack API に RequestURL を登録
-
-Event Subscription で ngrok によって生成された URL を登録(末尾に slack/events をつける)
+---
