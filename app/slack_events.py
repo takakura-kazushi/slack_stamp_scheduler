@@ -4,7 +4,7 @@ import os, re, logging
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from .db import supabase
-
+from .scheduler import scheduler
 
 load_dotenv(verbose=True)
 logger = logging.getLogger(__name__)
@@ -29,7 +29,8 @@ def clean_datetime_text(text):
     text = re.sub(r'\([月火水木金土日]\)', '', text)
     text = re.sub(r'[月火水木金土日]曜日', '', text)
     text = re.sub(r'[ぁ-ん]', '', text)
-    m = re.search(r'(\d{1,2})月(\d{1,2})日', text)
+    # 「月/日」または「月月日日」の形式にマッチさせる
+    m = re.search(r'(\d{1,2})[月/](\d{1,2})日?', text)
     date_part = f"{m.group(1)}/{m.group(2)}" if m else ''
     time_part = ''
     t = re.search(r'(\d{1,2})時半', text)
@@ -131,19 +132,59 @@ def extract_datetime_options(text):
     options = {}
     lines = text.split('\n')
     for line in lines:
-        if re.search(r':\w+:', line):
-            match = re.search(r':(\w+):\s*[:：]\s*([^\n]+)', line)
-            if match:
-                emoji, datetime_str = match.groups()
-                normalized_emoji = normalize_emoji(emoji)
-                datetime_str = clean_datetime_text(datetime_str)
-                dt = extract_datetime(datetime_str)
-                if dt:
-                    options[f":{normalized_emoji}:"] = dt
-                    logger.info(f"日時を抽出しました: {datetime_str} -> {dt}")
-                else:
-                    logger.info(f"日時を解析できませんでした: {datetime_str}")
+        match = re.search(r':(\w+):\s*(?:[:：]\s*)?(.+)', line)
+        if match:
+            emoji, datetime_str = match.groups()
+            normalized_emoji = normalize_emoji(emoji)
+            cleaned_str = clean_datetime_text(datetime_str)
+            dt = extract_datetime(cleaned_str)
+            if dt:
+                options[f":{normalized_emoji}:"] = dt
+                logger.info(f"日時を抽出しました: {datetime_str} -> {dt}")
+            else:
+                logger.info(f"日時を解析できませんでした: {datetime_str}")
     return options
+def send_reminder(main_message_ts: str):
+    """
+    指定されたスケジュールID（main_message_ts）に基づいてリマインドを送信する
+    """
+    logger.info(f"リマインドジョブを実行します: {main_message_ts}")
+    try:
+        # Supabaseからスケジュールを取得
+        response = supabase.table('schedules').select('*').eq('main_message_ts', main_message_ts).single().execute()
+        schedule_data = response.data
+
+        if not schedule_data:
+            logger.error(f"リマインド対象のスケジュールが見つかりません: {main_message_ts}")
+            return
+        
+        # 参加者リストを取得
+        participants = schedule_data.get('participants', {})
+        selected_emoji = schedule_data.get('selected_emoji')
+
+        if not selected_emoji or selected_emoji not in participants:
+            logger.error(f"参加者情報が見つかりません: {main_message_ts}")
+            return
+        
+        user_ids = participants[selected_emoji]
+
+        # リマインドメッセージを作成
+        event_dt = datetime.fromisoformat(schedule_data['selected_datetime'])
+        message = (
+            f"🔔 リマインダーです！\n\n"
+            f"明日 **{event_dt.strftime('%m月%d日 %H:%M')}** からの予定を忘れないでね！"
+        )
+
+        # 各参加者にDMを送信
+        for user_id in user_ids:
+            slack_client.chat_postMessage(channel=user_id, text=message)
+            logger.info(f"{user_id} にリマインドを送信しました。")
+            
+        # 送信済みフラグを更新
+        supabase.table('schedules').update({'is_reminder_sent': True}).eq('main_message_ts', main_message_ts).execute()
+
+    except Exception as e:
+        logger.error(f"リマインド送信中にエラーが発生しました: {e}")
 
 @router.post("/slack/events")
 async def handle_slack_events(req: Request):
@@ -158,6 +199,7 @@ async def handle_slack_events(req: Request):
             text = event.get("text", "")
             message_ts = event.get("ts", "")
             thread_ts = event.get("thread_ts", None)
+
             if thread_ts:
                 emoji_matches = re.findall(r'(:\w+:)', text)
                 if emoji_matches:
@@ -176,29 +218,44 @@ async def handle_slack_events(req: Request):
                         if decided:
                             if len(decided) == 1:
                                 emoji, dt_obj, dt_str = decided[0]
-                                if dt_obj.hour < 8:
-                                    reminder_dt = dt_obj.replace(hour=8, minute=0) - timedelta(days=1)
-                                else:
-                                    reminder_dt = dt_obj.replace(hour=8, minute=0)
+                                reminder_dt = dt_obj - timedelta(days=1)
                                 reminder_str = reminder_dt.strftime('%Y/%m/%d %H:%M')
                                 msg = (f"日時を\n{emoji} {dt_str}\nに決定しました。\n"
-                                       f"{reminder_str}にリマインドします。")
+                                       f"予定の24時間前（{reminder_str}頃）にリマインドします。")
                             else:
-                                msg = "日時を\n"
+                                msg = "日時を以下で決定しました。\n"
                                 for emoji, dt_obj, dt_str in decided:
-                                    if dt_obj.hour < 8:
-                                        reminder_dt = dt_obj.replace(hour=8, minute=0) - timedelta(days=1)
-                                    else:
-                                        reminder_dt = dt_obj.replace(hour=8, minute=0)
+                                    reminder_dt = dt_obj - timedelta(days=1)
                                     reminder_str = reminder_dt.strftime('%Y/%m/%d %H:%M')
-                                    msg += f"{emoji} {dt_str} （リマインド: {reminder_str}）\n"
-                                msg += "に決定しました。"
+                                    msg += f"・ {emoji} {dt_str} (リマインド: {reminder_str}頃)\n"
                             slack_client.chat_postMessage(
                                 channel=channel,
                                 text=msg,
                                 thread_ts=thread_ts
                             )
-                            logger.info(f"日程決定: {decided}")
+
+                            for emoji, dt_obj, dt_str in decided:
+                                reminder_dt = dt_obj - timedelta(days=1)
+
+                                # 過去の日時になっていないかチェック
+                                if reminder_dt > datetime.now():
+                                    job_id = f"reminder_{thread_ts}_{emoji.strip(':')}"
+                                    job = scheduler.add_job(
+                                        send_reminder,
+                                        trigger='date',
+                                        run_date=reminder_dt,
+                                        args=[thread_ts],
+                                        id=job_id,
+                                        replace_existing=True # 同じIDのジョブがあれば上書き
+                                    )
+                                    logger.info(f"リマインドを予約しました: JobID={job.id}, Time={reminder_dt}")
+
+                                    # DBにジョブIDなどを保存
+                                    supabase.table('schedules').update({
+                                        'selected_emoji': emoji,
+                                        'selected_datetime': dt_obj.isoformat(),
+                                        'reminder_job_id': job.id
+                                    }).eq('main_message_ts', thread_ts).execute()
                         else:
                             slack_client.chat_postEphemeral(
                                 channel=channel,
