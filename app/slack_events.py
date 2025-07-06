@@ -289,11 +289,28 @@ async def handle_slack_events(req: Request):
                 slack_client.chat_postEphemeral(channel=channel, user=user, text=message)
             else:
                 logger.info(f"候補日時が見つかりませんでした: {text}")
+
+        # リアクションが追加された場合の処理
         elif event.get("type") == "reaction_added":
             reaction = event.get("reaction", "")
             user_id = event.get("user", "")
             item = event.get("item", {})
             message_ts = item.get("ts", "")
+            # データベースに該当のスケジュールが存在するか確認
+            schedule_response = supabase.table('schedules').select('options').eq('main_message_ts', message_ts).single().execute()
+            
+            if schedule_response.data:
+                schedule_options = schedule_response.data.get('options', {})
+                normalized_reaction = f":{normalize_reaction(reaction)}:"
+
+                if normalized_reaction in schedule_options:
+                    # DBを更新する関数を呼び出す
+                    update_participants_in_db(message_ts, normalized_reaction, user_id)
+                else:
+                    logger.info(f"スケジュールにないスタンプへのリアクションは無視します: {normalized_reaction}")
+            else:
+                logger.info(f"候補日投稿以外のメッセージに対するリアクションは無視します: {message_ts}")
+                
             channel_id = item.get("channel", "")
             normalized_reaction = f":{normalize_reaction(reaction)}:"
             if message_ts in candidate_messages:
@@ -311,6 +328,22 @@ async def handle_slack_events(req: Request):
                     logger.info(f"有効なスタンプ: {list(message_info['options'].keys())}")
             else:
                 logger.info("候補日投稿以外のメッセージに対するリアクションは無視します")
+
+        # リアクションが削除された場合の処理
+        elif event.get("type") == "reaction_removed":
+            reaction = event.get("reaction", "")
+            user_id = event.get("user", "")
+            item = event.get("item", {})
+            message_ts = item.get("ts", "")
+            
+            # データベースに該当のスケジュールが存在するか確認
+            schedule_response = supabase.table('schedules').select('options').eq('main_message_ts', message_ts).single().execute()
+            
+            if schedule_response.data:
+                normalized_reaction = f":{normalize_reaction(reaction)}:"
+                # DBから参加者を削除する関数を呼び出す
+                remove_participant_from_db(message_ts, normalized_reaction, user_id)
+
     return {"ok": True}
 
 def save_new_schedule(message_ts: str, channel_id: str, options: dict):
@@ -331,3 +364,68 @@ def save_new_schedule(message_ts: str, channel_id: str, options: dict):
         logger.info(f"✅ Supabaseへのスケジュール保存に成功しました。ts: {message_ts}")
     except Exception as e:
         logger.error(f"❌ Supabaseへのスケジュール保存に失敗しました。ts: {message_ts}, Error: {e}")
+
+def update_participants_in_db(message_ts: str, emoji: str, user_id: str):
+    """
+    指定されたスタンプの参加者リストにユーザーを追加/更新する
+    """
+    try:
+        # DBから現在の参加者リストを取得
+        response = supabase.table('schedules').select('participants').eq('main_message_ts', message_ts).single().execute()
+        
+        if not response.data:
+            logger.info(f"DBに該当するスケジュールがありません: {message_ts}")
+            return
+
+        participants = response.data.get('participants', {})
+
+        # 参加者リストを更新
+        if emoji not in participants:
+            participants[emoji] = []
+        
+        # 既に参加者でなければ追加する
+        if user_id not in participants[emoji]:
+            participants[emoji].append(user_id)
+            logger.info(f"参加者を追加: {user_id} -> {emoji}")
+        else:
+            logger.info(f"参加者は既に追加済みです: {user_id} -> {emoji}")
+            return # 更新不要なのでここで処理を終了
+
+        # 更新した参加者リストをDBに保存
+        supabase.table('schedules').update({'participants': participants}).eq('main_message_ts', message_ts).execute()
+        logger.info(f"✅ DBの参加者情報を更新しました: ts={message_ts}")
+
+    except Exception as e:
+        logger.error(f"❌ DBの参加者情報更新に失敗しました: {e}")
+
+def remove_participant_from_db(message_ts: str, emoji: str, user_id: str):
+    """
+    指定されたスタンプの参加者リストからユーザーを削除する
+    """
+    try:
+        # DBから現在の参加者リストを取得
+        response = supabase.table('schedules').select('participants').eq('main_message_ts', message_ts).single().execute()
+        
+        if not response.data or not response.data.get('participants'):
+            logger.info(f"参加者削除対象のスケジュールまたは参加者リストが見つかりません: {message_ts}")
+            return
+
+        participants = response.data.get('participants')
+
+        # 参加者リストを更新
+        if emoji in participants and user_id in participants[emoji]:
+            participants[emoji].remove(user_id)
+            # もしそのスタンプの参加者が誰もいなくなったら、キーごと削除する
+            if not participants[emoji]:
+                del participants[emoji]
+            logger.info(f"参加者を削除: {user_id} -> {emoji}")
+        else:
+            logger.info(f"削除対象の参加者が見つかりません: {user_id} -> {emoji}")
+            return # 更新不要
+
+        # 更新した参加者リストをDBに保存
+        supabase.table('schedules').update({'participants': participants}).eq('main_message_ts', message_ts).execute()
+        logger.info(f"✅ DBの参加者情報を更新（削除）しました: ts={message_ts}")
+
+    except Exception as e:
+        logger.error(f"❌ DBの参加者情報更新（削除）に失敗しました: {e}")
