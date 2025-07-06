@@ -10,5 +10,5 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 # Slack Bot 用の処理は slack_events.py に切り出し
-from slack_events import router as slack_router 
+from .slack_events import router as slack_router 
 app.include_router(slack_router)

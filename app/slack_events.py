@@ -3,6 +3,7 @@ from slack_sdk.web import WebClient
 import os, re, logging
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from .db import supabase
 
 
 load_dotenv(verbose=True)
@@ -55,7 +56,7 @@ def clean_datetime_text(text):
     else:
         return text.strip()
 
-def extract_datetime(text):
+def extract_datetime(text: str):
     cleaned_text = clean_datetime_text(text)
     now = datetime.now()
     date_patterns = [
@@ -214,7 +215,13 @@ async def handle_slack_events(req: Request):
                         logger.info("スレッドが候補日投稿ではありません")
                     return {"ok": True}
             options = extract_datetime_options(text)
+
+                
+                
             if options:
+                # 新しい候補日投稿をSupabaseに保存
+                save_new_schedule(message_ts, channel, options)
+
                 candidate_messages[message_ts] = {"channel": channel, "options": options}
                 logger.info(f"候補日投稿を記録しました: {message_ts}")
                 logger.info(f"候補日時: {options}")
@@ -248,3 +255,22 @@ async def handle_slack_events(req: Request):
             else:
                 logger.info("候補日投稿以外のメッセージに対するリアクションは無視します")
     return {"ok": True}
+
+def save_new_schedule(message_ts: str, channel_id: str, options: dict):
+    """
+    新しい候補日投稿をSupabaseのschedulesテーブルに保存する
+    """
+    try:
+        options_for_db = {key: dt.isoformat() for key, dt in options.items()}
+        # Supabaseに挿入するデータを作成
+        insert_data = {
+            "main_message_ts": message_ts,
+            "channel_id": channel_id,
+            "options": options_for_db,
+            "participants": {}  # participantsは空のJSONで初期化
+        }
+        # データの挿入を実行
+        supabase.table('schedules').insert(insert_data).execute()
+        logger.info(f"✅ Supabaseへのスケジュール保存に成功しました。ts: {message_ts}")
+    except Exception as e:
+        logger.error(f"❌ Supabaseへのスケジュール保存に失敗しました。ts: {message_ts}, Error: {e}")
